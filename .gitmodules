@@ -1,3 +1,9 @@
 [submodule "manager"]
 	path = manager
 	url = git@github.com:Tulitanir/manager.git
+[submodule "proto-module"]
+	path = proto-module
+	url = git@github.com:Tulitanir/proto-module.git
+[submodule "task"]
+	path = task
+	url = git@github.com:Tulitanir/task.git

@@ -1,4 +1,8 @@
 package org.grid;
 
-public class Distrributor {
+import java.util.List;
+
+public class Distributor {
+    private Task currentTask;
+    private List<GridComms.WorkerRegistrationMessage> workers;
 }
