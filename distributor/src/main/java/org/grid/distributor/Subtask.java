@@ -1,4 +1,4 @@
-package org.grid;
+package org.grid.distributor;
 
 public class Subtask {
     private long id;

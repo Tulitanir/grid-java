@@ -1,4 +1,4 @@
-package org.grid;
+package org.grid.distributor;
 
 import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
@@ -6,8 +6,9 @@ import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import org.grid.GridComms;
+import org.grid.SubtaskExchangeGrpc;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -159,7 +160,7 @@ public class Distributor {
                         if (bytesRead == -1)
                             break;
                         GridComms.FileChunk fileChunk = GridComms.FileChunk.newBuilder()
-                                .setData(ByteString.copyFrom(buffer))
+                                .setData(ByteString.copyFrom(buffer, 0, bytesRead))
                                 .build();
                         uploadMessageStreamObserver.onNext(GridComms.SubtaskUploadMessage.newBuilder().setFileChunk(fileChunk).build());
                         bytesSentForFile += bytesRead;

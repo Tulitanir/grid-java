@@ -1,4 +1,4 @@
-package org.grid;
+package org.grid.distributor;
 
 import org.grid.annotations.Data;
 import org.grid.annotations.Entrypoint;
@@ -52,11 +52,16 @@ public class Task {
                 Enumeration<JarEntry> entries = jar.entries();
                 while (entries.hasMoreElements()) {
                     JarEntry entry = entries.nextElement();
-                    if (entry.getName().endsWith(".class")) {
+                    if (entry.getName().endsWith(".class") && !entry.getName().endsWith("module-info.class")) {
                         String className = entry.getName()
                                 .replace("/", ".")
                                 .replace(".class", "");
                         Class<?> clazz = classLoader.loadClass(className);
+                        Class<?> coordClass = classLoader.loadClass("org.grid.task.Coord");
+                        Object sampleCoord = coordClass.getConstructor(int.class, int.class).newInstance(0, 0);
+                        System.out.println("Sample Coord toString() via reflection: " + sampleCoord.toString());
+                        Method hashCodeMethod = coordClass.getDeclaredMethod("hashCode");
+                        System.out.println("hashCode method present: " + (hashCodeMethod.getDeclaringClass() == coordClass));
 
                         if (clazz.isAnnotationPresent(Result.class)) {
                             hasResult = true;
