@@ -7,3 +7,6 @@
 [submodule "task"]
 	path = task
 	url = git@github.com:Tulitanir/task.git
+[submodule "worker"]
+	path = worker
+	url = git@github.com:Tulitanir/worker.git
