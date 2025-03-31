@@ -2,6 +2,7 @@ package org.grid;
 
 import org.grid.annotations.Data;
 import org.grid.annotations.Entrypoint;
+import org.grid.annotations.Result;
 import org.grid.annotations.SubtaskCount;
 
 import java.io.File;
@@ -21,7 +22,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
-public class Task implements Runnable {
+public class Task {
     private String taskFolder;
     private BlockingQueue<Subtask> results;
     private final List<String> fileNames;
@@ -30,10 +31,6 @@ public class Task implements Runnable {
         this.taskFolder = taskFolder;
         this.fileNames = new ArrayList<>();
         validateTask();
-    }
-
-    public void run() {
-
     }
 
     private void validateTask() throws RuntimeException {
@@ -46,6 +43,7 @@ public class Task implements Runnable {
         fileNames.add(jarFile.getName());
 
         Long subtaskCount;
+        boolean hasResult = false;
 
         try (URLClassLoader classLoader = new URLClassLoader(
                 new URL[]{jarFile.toURI().toURL()},
@@ -60,6 +58,10 @@ public class Task implements Runnable {
                                 .replace(".class", "");
                         Class<?> clazz = classLoader.loadClass(className);
 
+                        if (clazz.isAnnotationPresent(Result.class)) {
+                            hasResult = true;
+                        }
+
                         if (clazz.isAnnotationPresent(Entrypoint.class)) {
                             subtaskCount = checkEntrypoint(clazz);
                             if (subtaskCount == null) {
@@ -69,6 +71,8 @@ public class Task implements Runnable {
                         }
                     }
                 }
+                if (!hasResult)
+                    throw new RuntimeException("Can't find result type");
             } catch (ClassNotFoundException | NoSuchMethodException | InvocationTargetException |
                      IllegalAccessException | InstantiationException e) {
                 throw new RuntimeException(e);
