@@ -24,9 +24,11 @@ import java.util.jar.JarFile;
 public class Task implements Runnable {
     private String taskFolder;
     private BlockingQueue<Subtask> results;
+    private final List<String> fileNames;
 
     public Task(String taskFolder) {
         this.taskFolder = taskFolder;
+        this.fileNames = new ArrayList<>();
         validateTask();
     }
 
@@ -40,6 +42,8 @@ public class Task implements Runnable {
         File jarFile = Arrays.stream(Objects.requireNonNull(new File(taskFolder).listFiles()))
                 .filter(f -> f.getName().endsWith(".jar"))
                 .findFirst().orElseThrow();
+
+        fileNames.add(jarFile.getName());
 
         Long subtaskCount;
 
@@ -88,7 +92,6 @@ public class Task implements Runnable {
                 List<Object> args = new ArrayList<>();
 
                 var constructor = findDataConstructor(workerClass);
-
                 for (Parameter param : constructor.getParameters()) {
                     if (param.isAnnotationPresent(Data.class)) {
                         String fileName = param.getAnnotation(Data.class).value();
@@ -97,6 +100,7 @@ public class Task implements Runnable {
                             throw new RuntimeException(
                                     "Required data file not found: " + filePath);
                         }
+                        fileNames.add(fileName);
                         var fileConstructor = param.getType().getConstructor(String.class);
                         args.add(fileConstructor.newInstance(filePath.toString()));
                     }
@@ -124,6 +128,9 @@ public class Task implements Runnable {
         throw new NoSuchMethodException("No constructor with @Data parameters found in " + workerClass.getName());
     }
 
+    public String[] getFileNames() {
+        return fileNames.toArray(new String[0]);
+    }
 
     public void addResult(Subtask subtask) {
         results.add(subtask);

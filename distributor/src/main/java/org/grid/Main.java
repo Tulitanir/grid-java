@@ -2,6 +2,7 @@ package org.grid;
 
 public class Main {
     public static void main(String[] args) {
-        var task = new Task("data");
+        var distributor = new Distributor("localhost", 50051, "data");
+        distributor.submitSubtask(0, 0);
     }
 }
