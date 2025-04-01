@@ -350,7 +350,6 @@ public class Distributor {
         }
     }
 
-    // Реализация сервера приёма результатов остаётся без изменений.
     private static class ResultReceiverImpl extends ResultReceiverGrpc.ResultReceiverImplBase {
         private final Task task;
 
@@ -374,11 +373,9 @@ public class Distributor {
                 String resultObject = request.getResultData();
                 String processingMessage = "Result processed successfully.";
 
-                // Если результат неуспешный, можно пометить подзадачу как FAILED и/или запланировать её повторное выполнение.
                 if (!request.getSuccess()) {
                     System.out.printf("Result for subtask %s/%s indicates failure. Scheduling reassignment.%n", taskId, subtaskId);
                     task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, resultObject, System.currentTimeMillis()));
-                    // Возможно, здесь стоит инициировать немедленное повторное назначение
                 } else {
                     task.addResult(new Subtask(subtaskId, SubtaskStatus.DONE, resultObject, System.currentTimeMillis()));
                 }
