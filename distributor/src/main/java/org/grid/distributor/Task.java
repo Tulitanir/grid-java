@@ -4,6 +4,7 @@ import org.grid.annotations.Data;
 import org.grid.annotations.Entrypoint;
 import org.grid.annotations.Result;
 import org.grid.annotations.SubtaskCount;
+import org.xml.sax.helpers.AttributesImpl;
 
 import java.io.File;
 import java.io.IOException;
@@ -19,13 +20,37 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
 public class Task {
     private String taskFolder;
-    private BlockingQueue<Subtask> results;
+    private ConcurrentMap<Long, Subtask> results;
     private final List<String> fileNames;
+    private AtomicLong left;
+    private long taskId;
+    private Long subtaskCount;
+
+    public long getSubtaskCount() {
+        return subtaskCount;
+    }
+
+    public String[] getFileNames() {
+        return fileNames.toArray(new String[0]);
+    }
+
+    public long getTaskId() {
+        return taskId;
+    }
+
+    public ConcurrentMap<Long, Subtask> getResults() {
+        return results;
+    }
 
     public Task(String taskFolder) {
         this.taskFolder = taskFolder;
@@ -42,7 +67,6 @@ public class Task {
 
         fileNames.add(jarFile.getName());
 
-        Long subtaskCount;
         boolean hasResult = false;
 
         try (URLClassLoader classLoader = new URLClassLoader(
@@ -69,10 +93,11 @@ public class Task {
 
                         if (clazz.isAnnotationPresent(Entrypoint.class)) {
                             subtaskCount = checkEntrypoint(clazz);
+                            left = new AtomicLong(subtaskCount);
                             if (subtaskCount == null) {
                                 throw new RuntimeException("Can't determine subtask count");
                             }
-                            results = new ArrayBlockingQueue<>(Math.toIntExact(subtaskCount));
+                            results = new ConcurrentHashMap<>(Math.toIntExact(subtaskCount));
                         }
                     }
                 }
@@ -137,11 +162,14 @@ public class Task {
         throw new NoSuchMethodException("No constructor with @Data parameters found in " + workerClass.getName());
     }
 
-    public String[] getFileNames() {
-        return fileNames.toArray(new String[0]);
+    public AtomicLong getLeft() {
+        return left;
     }
 
     public void addResult(Subtask subtask) {
-        results.add(subtask);
+        if (subtask.getStatus() == SubtaskStatus.DONE) {
+            left.addAndGet(-1);
+        }
+        results.put(subtask.getId(), subtask);
     }
 }
