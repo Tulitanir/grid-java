@@ -1,10 +1,9 @@
 package org.grid.distributor;
 
+import com.google.protobuf.ByteString;
 import org.grid.annotations.*;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.Serializable;
+import java.io.*;
 import java.lang.reflect.*;
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -31,6 +30,7 @@ public class Task {
     private final Class<?> resultType;
     private String jarFilePath = null;
     private Method aggregationMethod = null;
+    private Object finalResult = null;
 
     private static class ValidationResult {
         Iterator<?> iterator = null;
@@ -277,10 +277,37 @@ public class Task {
         return null;
     }
 
+    public Object getFinalResult() {
+        return finalResult;
+    }
+
     public void addResult(Subtask subtask) {
         Subtask old = results.get(subtask.getId());
         if (old == null || !old.getStatus().equals(SubtaskStatus.DONE)) {
             results.put(subtask.getId(), subtask);
+
+            try {
+                if (this.finalResult == null) {
+                    this.finalResult = deserialize(subtask.getData(), getTaskClassLoader());
+                } else {
+                    var newResult = deserialize(subtask.getData(), getTaskClassLoader());
+                    this.finalResult = aggregationMethod.invoke(null, finalResult, newResult);
+                }
+            } catch (IOException | ClassNotFoundException | IllegalAccessException | InvocationTargetException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    private static Object deserialize(ByteString byteString, ClassLoader taskClassLoader) throws IOException, ClassNotFoundException {
+        if (byteString == null || byteString.isEmpty()) {
+            return null;
+        }
+        byte[] data = byteString.toByteArray();
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(data);
+             ObjectInputStream ois = new TaskSpecificObjectInputStream(bis, taskClassLoader)) {
+            return ois.readObject();
         }
     }
 }
+

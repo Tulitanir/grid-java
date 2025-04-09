@@ -36,5 +36,6 @@ public class Main {
         distributor.stopResultServer();
 
         resultServerThread.join();
+        System.out.println("Final result: " + distributor.getTask().getFinalResult());
     }
 }

@@ -452,7 +452,6 @@ public class Distributor {
     }
 }
 
-// Класс для десериализации с использованием нужного classLoader
 class TaskSpecificObjectInputStream extends ObjectInputStream {
     private final ClassLoader taskClassLoader;
 
