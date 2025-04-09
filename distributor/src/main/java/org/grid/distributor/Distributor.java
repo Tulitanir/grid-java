@@ -13,19 +13,25 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
-import java.util.List;
+import java.util.Iterator;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public class Distributor {
+    private final static Logger logger = Logger.getLogger(Distributor.class.getName());
+
     private static final int CHUNK_SIZE = 8 * 1024;
     private static final int SUBTASK_TIMEOUT_MINUTES = 10;
     private static final int RESULT_SERVER_PORT = 10000;
     private static final String DISTRIBUTOR_HOST = "localhost";
-    private static final int MAX_RETRIES = 3; // максимальное число попыток
+    private static final int MAX_RETRIES = 3;
 
     private final String managerHost;
     private final int managerPort;
@@ -42,18 +48,20 @@ public class Distributor {
     private volatile boolean skipCurrentFileUpload = false;
     private String currentlySendingFile = null;
 
-    public Distributor(String managerHost, int managerPort, String taskDirectory) {
-        this(managerHost, managerPort, taskDirectory, DISTRIBUTOR_HOST, RESULT_SERVER_PORT);
+    private final ScheduledExecutorService subtaskMonitoringScheduler = Executors.newSingleThreadScheduledExecutor();
+
+    public Distributor(String managerHost, int managerPort, String taskDirectory, long taskId) {
+        this(managerHost, managerPort, taskDirectory, DISTRIBUTOR_HOST, RESULT_SERVER_PORT, taskId);
     }
 
-    public Distributor(String managerHost, int managerPort, String taskDirectory, String distributorHost, int resultPort) {
+    public Distributor(String managerHost, int managerPort, String taskDirectory, String distributorHost, int resultPort, long taskId) {
         this.managerHost = managerHost;
         this.managerPort = managerPort;
         this.taskDirectory = taskDirectory;
         this.distributorHost = distributorHost;
         this.resultPort = resultPort;
-        this.task = new Task(taskDirectory);
-        connectToManager();
+        this.task = new Task(taskId, taskDirectory);
+        subtaskMonitoringScheduler.scheduleWithFixedDelay(this::checkRunningTasks, SUBTASK_TIMEOUT_MINUTES, SUBTASK_TIMEOUT_MINUTES, TimeUnit.SECONDS);
     }
 
     private void connectToManager() {
@@ -134,12 +142,32 @@ public class Distributor {
         return task;
     }
 
-    public boolean submitSubtask(long taskId, long subtaskId) {
+    public void runTask() {
+        long taskId = task.getId();
+        Iterator<?> subtaskIterator = task.getSubtaskIterator();
+
+        Object nextSubtask = null;
+        long subtaskId = 0;
+        while (subtaskIterator.hasNext()) {
+            nextSubtask = subtaskIterator.next();
+            try {
+                ByteString inputDataBytes = Distributor.serializeToByteString(nextSubtask);
+                subtaskId++;
+                submitSubtask(taskId, subtaskId, inputDataBytes);
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "Failed to serialize input data for task " + taskId + ", internal subtask ID " + subtaskId + ". Aborting task.", e);
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    public void submitSubtask(long taskId, long subtaskId, ByteString byteString) {
         int attempt = 0;
         boolean success = false;
+        task.addResult(new Subtask(subtaskId, SubtaskStatus.RUNNING, null, System.currentTimeMillis(), byteString));
         while (attempt < MAX_RETRIES && !success) {
             System.out.printf("Submitting subtask %s/%s, attempt %d%n", taskId, subtaskId, attempt + 1);
-            success = attemptSubmitSubtask(taskId, subtaskId);
+            success = attemptSubmitSubtask(taskId, subtaskId, byteString);
             if (!success) {
                 System.err.printf("Attempt %d for subtask %s/%s failed.%n", attempt + 1, taskId, subtaskId);
                 attempt++;
@@ -154,12 +182,12 @@ public class Distributor {
             System.err.printf("Subtask %s/%s failed after %d attempts. Marking as FAILED and scheduling reassignment.%n", taskId, subtaskId, MAX_RETRIES);
             task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis()));
         }
-        return success;
     }
 
-    private boolean attemptSubmitSubtask(long taskId, long subtaskId) {
+    private boolean attemptSubmitSubtask(long taskId, long subtaskId, ByteString byteString) {
         String[] files = task.getFileNames();
         System.out.printf("Try to submit subtask %s/%s with files: %s%n", taskId, subtaskId, Arrays.toString(files));
+
 
         GridComms.WorkerAssignment workerAssignment = requestWorkerFromManager(taskId, subtaskId);
         if (!workerAssignment.getWorkerAvailable()) {
@@ -234,11 +262,13 @@ public class Distributor {
                         .setSubtaskId(subtaskId)
                         .setDistributorHost(distributorHost)
                         .setDistributorPort(resultPort)
+                        .setSubtaskInputData(byteString)
                         .build();
 
                 uploadMessageStreamObserver.onNext(GridComms.SubtaskUploadMessage.newBuilder().setSubtaskMetadata(metadata).build());
 
-                A: for (String fileName : files) {
+                A:
+                for (String fileName : files) {
                     Path path = Paths.get(taskDirectory, fileName);
 
                     if (!Files.exists(path) || !Files.isReadable(path)) {
@@ -332,21 +362,62 @@ public class Distributor {
                     .setWorkerAvailable(false)
                     .setMessage("Failed to contact manager: " + e.getStatus())
                     .build();
+        } finally {
+            disconnectFromManager();
         }
     }
 
-    public void reassignFailedSubtasks() {
-        for (Map.Entry<Long, Subtask> entry : task.getResults().entrySet()) {
-            if (entry.getValue().getStatus() == SubtaskStatus.FAILED) {
-                long subtaskId = entry.getKey();
-                System.out.printf("Reassigning failed subtask %s%n", subtaskId);
-                boolean success = submitSubtask(task.getTaskId(), subtaskId);
-                if (success) {
-                    System.out.printf("Reassignment of subtask %s succeeded.%n", subtaskId);
-                } else {
-                    System.out.printf("Reassignment of subtask %s failed again.%n", subtaskId);
+    private void checkRunningTasks() {
+        logger.info("Start checking running tasks");
+        var runningTasks = task.getResults().entrySet().stream()
+                .filter(entry -> entry.getValue().getStatus().equals(SubtaskStatus.RUNNING)).toList();
+
+        connectToManager();
+        try {
+            for (Entry<Long, Subtask> task : runningTasks) {
+                var subtaskId = task.getValue().getId();
+                var request = GridComms.WorkerStatusRequest.newBuilder()
+                        .setTaskId(this.task.getId())
+                        .setSubtaskId(subtaskId)
+                        .build();
+
+                GridComms.WorkerStatusResponse response = managerStub.withDeadlineAfter(5, TimeUnit.SECONDS)
+                        .getWorkerStatus(request);
+
+                if (response.getWorkerStatus().equals(GridComms.WorkerStatus.DEAD) || response.getWorkerStatus().equals(GridComms.WorkerStatus.UNKNOWN)) {
+                    var tasks = this.task.getResults();
+                    var failedTask = tasks.get(subtaskId);
+                    this.task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), failedTask.getData()));
                 }
             }
+        } finally {
+            disconnectFromManager();
+            reassignFailedSubtasks();
+        }
+    }
+
+    private void reassignFailedSubtasks() {
+        System.out.println(task.getResults());
+        for (Entry<Long, Subtask> entry : task.getResults().entrySet()) {
+            if (entry.getValue().getStatus().equals(SubtaskStatus.FAILED)) {
+                long subtaskId = entry.getKey();
+                ByteString inputData = entry.getValue().getData();
+                if (inputData == null)
+                    throw new RuntimeException("Impossible to reassign subtask " + entry.getValue().getId());
+                logger.info(String.format("Reassigning failed subtask %s%n", subtaskId));
+                submitSubtask(task.getId(), subtaskId, inputData);
+                logger.info(String.format("Reassignment of subtask %s%n", subtaskId));
+            }
+        }
+    }
+
+    private static ByteString serializeToByteString(Object obj) throws Exception {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+
+            oos.writeObject(obj);
+            oos.flush();
+            return ByteString.copyFrom(baos.toByteArray());
         }
     }
 
@@ -370,21 +441,61 @@ public class Distributor {
                 System.out.println("Received result for unknown or already completed Task ID: " + taskId);
                 ackBuilder.setAcknowledged(false).setMessage("Task ID " + taskId + " not found or already completed.");
             } else {
-                String resultObject = request.getResultData();
-                String processingMessage = "Result processed successfully.";
+                try {
+                    Object resultObject = Distributor.deserialize(request.getResultData(), task.getTaskClassLoader());
+                    System.out.println(resultObject);
 
-                if (!request.getSuccess()) {
-                    System.out.printf("Result for subtask %s/%s indicates failure. Scheduling reassignment.%n", taskId, subtaskId);
-                    task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, resultObject, System.currentTimeMillis()));
-                } else {
-                    task.addResult(new Subtask(subtaskId, SubtaskStatus.DONE, resultObject, System.currentTimeMillis()));
+                    if (!request.getSuccess()) {
+                        System.out.printf("Result for subtask %s/%s indicates failure. Scheduling reassignment.%n", taskId, subtaskId);
+                        task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, resultObject, System.currentTimeMillis()));
+                    } else {
+                        task.addResult(new Subtask(subtaskId, SubtaskStatus.DONE, resultObject, System.currentTimeMillis()));
+                    }
+                } catch (IOException | ClassNotFoundException e) {
+                    throw new RuntimeException(e);
                 }
 
-                ackBuilder.setAcknowledged(true).setMessage(processingMessage);
+                ackBuilder.setAcknowledged(true).setMessage("Result processed successfully.");
             }
 
             responseObserver.onNext(ackBuilder.build());
             responseObserver.onCompleted();
+        }
+    }
+
+    private static Object deserialize(ByteString byteString, ClassLoader taskClassLoader) throws IOException, ClassNotFoundException {
+        if (byteString == null || byteString.isEmpty()) {
+            return null;
+        }
+        byte[] data = byteString.toByteArray();
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(data);
+             ObjectInputStream ois = new TaskSpecificObjectInputStream(bis, taskClassLoader)) {
+            return ois.readObject();
+        }
+    }
+}
+
+class TaskSpecificObjectInputStream extends ObjectInputStream {
+    private final ClassLoader taskClassLoader;
+
+    public TaskSpecificObjectInputStream(InputStream in, ClassLoader taskClassLoader) throws IOException {
+        super(in);
+        this.taskClassLoader = Objects.requireNonNull(taskClassLoader, "Task ClassLoader cannot be null");
+    }
+
+    @Override
+    protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {
+        String className = desc.getName();
+        try {
+            return Class.forName(className, false, taskClassLoader);
+        } catch (ClassNotFoundException e) {
+            System.err.println("Class " + className + " not found in task classloader, trying super.resolveClass");
+            try {
+                return super.resolveClass(desc);
+            } catch (ClassNotFoundException e2) {
+                System.err.println("Class " + className + " not found in task classloader nor default classloader.");
+                throw e2;
+            }
         }
     }
 }
