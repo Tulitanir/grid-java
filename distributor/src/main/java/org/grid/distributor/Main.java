@@ -1,9 +1,5 @@
 package org.grid.distributor;
 
-import org.grid.distributor.Distributor;
-import org.grid.distributor.Subtask;
-import org.grid.distributor.SubtaskStatus;
-
 import java.io.IOException;
 import java.util.Map;
 
@@ -24,8 +20,6 @@ public class Main {
 
         distributor.runTask();
 
-        // Вместо немедленного завершения фоновых процессов
-        // ждем, пока все подзадачи не будут либо выполнены, либо окончательно провалены.
         boolean allDone = false;
         while (!allDone) {
             Map<Long, Subtask> results = distributor.getTask().getResults();
@@ -39,6 +33,7 @@ public class Main {
 
         distributor.shutdownScheduler();
         distributor.shutdownManagerChannel();
+        distributor.stopResultServer();
 
         resultServerThread.join();
     }
