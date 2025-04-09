@@ -28,7 +28,7 @@ public class Distributor {
     private final static Logger logger = Logger.getLogger(Distributor.class.getName());
 
     private static final int CHUNK_SIZE = 8 * 1024;
-    private static final int SUBTASK_TIMEOUT_MINUTES = 10;
+    private static final int SUBTASK_TIMEOUT_MINUTES = 1;
     private static final int RESULT_SERVER_PORT = 10000;
     private static final String DISTRIBUTOR_HOST = "localhost";
     private static final int MAX_RETRIES = 3;
@@ -50,11 +50,11 @@ public class Distributor {
 
     private final ScheduledExecutorService subtaskMonitoringScheduler = Executors.newSingleThreadScheduledExecutor();
 
-    public Distributor(String managerHost, int managerPort, String taskDirectory, long taskId) {
+    public Distributor(String managerHost, int managerPort, String taskDirectory, long taskId) throws InterruptedException {
         this(managerHost, managerPort, taskDirectory, DISTRIBUTOR_HOST, RESULT_SERVER_PORT, taskId);
     }
 
-    public Distributor(String managerHost, int managerPort, String taskDirectory, String distributorHost, int resultPort, long taskId) {
+    public Distributor(String managerHost, int managerPort, String taskDirectory, String distributorHost, int resultPort, long taskId) throws InterruptedException {
         this.managerHost = managerHost;
         this.managerPort = managerPort;
         this.taskDirectory = taskDirectory;
@@ -96,6 +96,20 @@ public class Distributor {
         }
     }
 
+    public void shutdownScheduler() {
+        System.out.println("Shutting down scheduled executor service...");
+        subtaskMonitoringScheduler.shutdown();
+        try {
+            if (!subtaskMonitoringScheduler.awaitTermination(10, TimeUnit.SECONDS)) {
+                System.out.println("Scheduled executor did not terminate in the given time. Forcing shutdown.");
+                subtaskMonitoringScheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            subtaskMonitoringScheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
     public void startResultServer() throws IOException {
         if (resultServer == null || resultServer.isTerminated()) {
             System.out.println("Starting Result Receiver server on port " + resultPort);
@@ -125,6 +139,7 @@ public class Distributor {
         if (resultServer != null && !resultServer.isShutdown()) {
             System.out.println("Stopping Result Receiver server...");
             resultServer.shutdown();
+            subtaskMonitoringScheduler.shutdown();
             try {
                 if (!resultServer.awaitTermination(10, TimeUnit.SECONDS)) {
                     System.out.println("Result Receiver server did not terminate gracefully. Forcing shutdown.");
@@ -368,7 +383,7 @@ public class Distributor {
     }
 
     private void checkRunningTasks() {
-        logger.info("Start checking running tasks");
+        System.out.println("Start checking running tasks");
         var runningTasks = task.getResults().entrySet().stream()
                 .filter(entry -> entry.getValue().getStatus().equals(SubtaskStatus.RUNNING)).toList();
 
@@ -391,6 +406,7 @@ public class Distributor {
                 }
             }
         } finally {
+            System.out.println("пиздец");
             disconnectFromManager();
             reassignFailedSubtasks();
         }
