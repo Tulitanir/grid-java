@@ -27,7 +27,6 @@ public class Distributor {
     private final static Logger logger = Logger.getLogger(Distributor.class.getName());
 
     private static final int CHUNK_SIZE = 8 * 1024;
-    // Если вы хотите задержку в минутах – здесь указываем минуты и используем TimeUnit.MINUTES при планировании.
     private static final int SUBTASK_TIMEOUT_MINUTES = 20;
     private static final int RESULT_SERVER_PORT = 10000;
     private static final String DISTRIBUTOR_HOST = "localhost";
@@ -35,7 +34,6 @@ public class Distributor {
 
     private final String managerHost;
     private final int managerPort;
-    // Переиспользуемый канал для общения с менеджером
     private ManagedChannel managerChannel;
     private GridManagerGrpc.GridManagerBlockingStub managerStub;
 
@@ -49,7 +47,6 @@ public class Distributor {
     private volatile boolean skipCurrentFileUpload = false;
     private String currentlySendingFile = null;
 
-    // Планировщик для периодического опроса состояния подзадач
     private final ScheduledExecutorService subtaskMonitoringScheduler = Executors.newSingleThreadScheduledExecutor();
 
     public Distributor(String managerHost, int managerPort, String taskDirectory, long taskId) throws InterruptedException {
@@ -63,9 +60,7 @@ public class Distributor {
         this.distributorHost = distributorHost;
         this.resultPort = resultPort;
         this.task = new Task(taskId, taskDirectory);
-        // Открываем канал к менеджеру один раз при инициализации
         openManagerChannel();
-        // Планируем опрос состояния подзадач каждые SUBTASK_TIMEOUT_MINUTES минут
         subtaskMonitoringScheduler.scheduleWithFixedDelay(() -> {
             try {
                 checkRunningTasks();
@@ -100,7 +95,6 @@ public class Distributor {
         }
     }
 
-    // Явное завершение работы планировщика
     public void shutdownScheduler() {
         logger.info("Shutting down scheduled executor service...");
         subtaskMonitoringScheduler.shutdown();
@@ -139,7 +133,6 @@ public class Distributor {
         }
     }
 
-    // Здесь не вызываем shutdown планировщика – он будет работать, пока вы его явно не остановите
     public void stopResultServer() {
         if (resultServer != null && !resultServer.isShutdown()) {
             logger.info("Stopping Result Receiver server...");
@@ -197,7 +190,7 @@ public class Distributor {
         }
         if (!success) {
             logger.severe(String.format("Subtask %d/%d failed after %d attempts. Marking as FAILED.", taskId, subtaskId, MAX_RETRIES));
-            task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis()));
+            task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), byteString));
         }
     }
 
@@ -213,7 +206,6 @@ public class Distributor {
 
         ManagedChannel channel = null;
         try {
-            // Создаем отдельный канал для обмена данными с рабочим узлом
             channel = ManagedChannelBuilder
                     .forAddress(workerAssignment.getAssignedWorker().getHost(), workerAssignment.getAssignedWorker().getPort())
                     .usePlaintext()
