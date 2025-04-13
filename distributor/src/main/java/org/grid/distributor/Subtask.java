@@ -5,11 +5,11 @@ import com.google.protobuf.ByteString;
 public class Subtask {
     private long id;
     private SubtaskStatus status;
-    private Object result;
+    private ByteString result;
     private long startTime;
     private ByteString data;
 
-    public Subtask(long id, SubtaskStatus status, Object result, long startTime) {
+    public Subtask(long id, SubtaskStatus status, ByteString result, long startTime) {
         this.id = id;
         this.status = status;
         this.result = result;
@@ -20,7 +20,7 @@ public class Subtask {
         return data;
     }
 
-    public Subtask(long id, SubtaskStatus status, Object result, long startTime, ByteString data) {
+    public Subtask(long id, SubtaskStatus status, ByteString result, long startTime, ByteString data) {
         this.id = id;
         this.status = status;
         this.result = result;
@@ -34,5 +34,9 @@ public class Subtask {
 
     public SubtaskStatus getStatus() {
         return status;
+    }
+
+    public ByteString getResult() {
+        return result;
     }
 }

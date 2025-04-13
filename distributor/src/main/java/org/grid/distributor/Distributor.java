@@ -139,7 +139,7 @@ public class Distributor {
             resultServer.shutdown();
             try {
                 if (!resultServer.awaitTermination(10, TimeUnit.SECONDS)) {
-                    logger.info("Result Receiver server did not terminate gracefully. Forcing shutdown.");
+                    logger.warning("Result Receiver server did not terminate gracefully. Forcing shutdown.");
                     resultServer.shutdownNow();
                 }
             } catch (InterruptedException e) {
@@ -174,7 +174,11 @@ public class Distributor {
     public void submitSubtask(long taskId, long subtaskId, ByteString byteString) {
         int attempt = 0;
         boolean success = false;
-        task.addResult(new Subtask(subtaskId, SubtaskStatus.RUNNING, null, System.currentTimeMillis(), byteString));
+        try {
+            task.addResult(new Subtask(subtaskId, SubtaskStatus.RUNNING, null, System.currentTimeMillis(), byteString));
+        } catch (IOException | ClassNotFoundException e) {
+            throw new RuntimeException(e);
+        }
         while (attempt < MAX_RETRIES && !success) {
             logger.info(String.format("Submitting subtask %d/%d, attempt %d", taskId, subtaskId, attempt + 1));
             success = attemptSubmitSubtask(taskId, subtaskId, byteString);
@@ -190,7 +194,11 @@ public class Distributor {
         }
         if (!success) {
             logger.severe(String.format("Subtask %d/%d failed after %d attempts. Marking as FAILED.", taskId, subtaskId, MAX_RETRIES));
-            task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), byteString));
+            try {
+                task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), byteString));
+            } catch (IOException | ClassNotFoundException e) {
+                throw new RuntimeException(e);
+            }
         }
     }
 
@@ -313,7 +321,6 @@ public class Distributor {
                 if (!latch.await(SUBTASK_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
                     logger.severe(String.format("Worker did not respond in time for subtask %d/%d", taskId, subtaskId));
                     overallSuccess[0] = false;
-                    // Принудительно уведомляем об ошибке
                     responseObserver.onError(Status.CANCELLED.withDescription("Timeout waiting for worker reply").asRuntimeException());
                 }
             } catch (InterruptedException e) {
@@ -370,6 +377,8 @@ public class Distributor {
                 }
             } catch (StatusRuntimeException e) {
                 logger.log(Level.SEVERE, String.format("Error checking status for subtask %d: %s", subtaskId, e.getStatus()), e);
+            } catch (IOException | ClassNotFoundException e) {
+                throw new RuntimeException(e);
             }
         }
         logger.info("Finished checking running tasks");
@@ -421,33 +430,22 @@ public class Distributor {
                 ackBuilder.setAcknowledged(false)
                         .setMessage("Task " + taskId + " not found or already completed.");
             } else {
+                ByteString resultBytes = request.getResultData();
+                logger.info("Result object: " + resultBytes);
                 try {
-                    Object resultObject = deserialize(request.getResultData(), task.getTaskClassLoader());
-                    logger.info("Result object: " + resultObject);
                     if (!request.getSuccess()) {
                         logger.warning(String.format("Result for subtask %d/%d indicates failure. Scheduling reassignment.", taskId, subtaskId));
-                        task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, resultObject, System.currentTimeMillis()));
+                        task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, resultBytes, System.currentTimeMillis()));
                     } else {
-                        task.addResult(new Subtask(subtaskId, SubtaskStatus.DONE, resultObject, System.currentTimeMillis()));
+                        task.addResult(new Subtask(subtaskId, SubtaskStatus.DONE, resultBytes, System.currentTimeMillis()));
                     }
-                } catch (IOException | ClassNotFoundException e) {
+                } catch (ClassNotFoundException | IOException e) {
                     throw new RuntimeException(e);
                 }
                 ackBuilder.setAcknowledged(true).setMessage("Result processed successfully.");
             }
             responseObserver.onNext(ackBuilder.build());
             responseObserver.onCompleted();
-        }
-    }
-
-    private static Object deserialize(ByteString byteString, ClassLoader taskClassLoader) throws IOException, ClassNotFoundException {
-        if (byteString == null || byteString.isEmpty()) {
-            return null;
-        }
-        byte[] data = byteString.toByteArray();
-        try (ByteArrayInputStream bis = new ByteArrayInputStream(data);
-             ObjectInputStream ois = new TaskSpecificObjectInputStream(bis, taskClassLoader)) {
-            return ois.readObject();
         }
     }
 }

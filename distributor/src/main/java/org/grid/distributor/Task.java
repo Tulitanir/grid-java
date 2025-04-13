@@ -27,12 +27,14 @@ public class Task {
     private final String taskFolder;
     private ConcurrentMap<Long, Subtask> results;
     private final List<String> fileNames;
+    private final ClassLoader classLoader;
     private final Class<?> resultType;
     private String jarFilePath = null;
     private Method aggregationMethod = null;
     private Object finalResult = null;
 
     private static class ValidationResult {
+        ClassLoader classLoader = null;
         Iterator<?> iterator = null;
         Class<?> resultType = null;
         List<String> requiredFiles = new ArrayList<>();
@@ -61,7 +63,7 @@ public class Task {
         this.fileNames = new ArrayList<>();
         this.results = new ConcurrentHashMap<>();
         ValidationResult validationResult = validateTask();
-        if (validationResult == null) throw new RuntimeException("Jar validation failed");
+        this.classLoader = validationResult.classLoader;
         this.subtaskIterator = validationResult.iterator;
         this.resultType = validationResult.resultType;
         this.fileNames.addAll(validationResult.requiredFiles);
@@ -171,6 +173,8 @@ public class Task {
                 if (!iteratorMethodFound) {
                     throw new RuntimeException("Can't find subtask iterator");
                 }
+
+                validationResult.classLoader = classLoader;
             } catch (ClassNotFoundException | InvocationTargetException | NoSuchMethodException |
                      IllegalAccessException | InstantiationException e) {
                 throw new RuntimeException(e);
@@ -178,7 +182,6 @@ public class Task {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-
         return validationResult;
     }
 
@@ -281,21 +284,30 @@ public class Task {
         return finalResult;
     }
 
-    public void addResult(Subtask subtask) {
+    public void addResult(Subtask subtask) throws IOException, ClassNotFoundException {
         Subtask old = results.get(subtask.getId());
         if (old == null || !old.getStatus().equals(SubtaskStatus.DONE)) {
             results.put(subtask.getId(), subtask);
+        }
 
-            try {
-                if (this.finalResult == null) {
-                    this.finalResult = deserialize(subtask.getData(), getTaskClassLoader());
-                } else {
-                    var newResult = deserialize(subtask.getData(), getTaskClassLoader());
-                    this.finalResult = aggregationMethod.invoke(null, finalResult, newResult);
-                }
-            } catch (IOException | ClassNotFoundException | IllegalAccessException | InvocationTargetException e) {
-                throw new RuntimeException(e);
+        var result = deserialize(subtask.getResult(), classLoader);
+
+        if (result == null) {
+            logger.warning("Result of subtask " + subtask.getId() + " is null");
+            return;
+        }
+        if (!(this.resultType.isInstance(result))) {
+            logger.warning("Result of subtask " + subtask.getId() + "  isn't instance of result type. " + result.getClass().getName() + ":" + this.resultType.getName());
+        }
+
+        try {
+            if (this.finalResult == null) {
+                this.finalResult = result;
+            } else {
+                this.finalResult = aggregationMethod.invoke(null, finalResult, result);
             }
+        } catch (IllegalAccessException | InvocationTargetException e) {
+            throw new RuntimeException(e);
         }
     }
 
