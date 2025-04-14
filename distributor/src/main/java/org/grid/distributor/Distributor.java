@@ -370,8 +370,7 @@ public class Distributor {
             try {
                 GridComms.WorkerStatusResponse response = managerStub.withDeadlineAfter(5, TimeUnit.SECONDS)
                         .getWorkerStatus(request);
-                if (response.getWorkerStatus().equals(GridComms.WorkerStatus.DEAD)
-                        || response.getWorkerStatus().equals(GridComms.WorkerStatus.UNKNOWN)) {
+                if (response.getWorkerStatus().equals(GridComms.WorkerStatus.DEAD)) {
                     Subtask failedTask = task.getResults().get(subtaskId);
                     task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), failedTask.getData()));
                 }
