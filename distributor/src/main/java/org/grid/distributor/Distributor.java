@@ -12,7 +12,6 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
@@ -34,8 +33,6 @@ public class Distributor {
 
     private final String managerHost;
     private final int managerPort;
-    private ManagedChannel managerChannel;
-    private GridManagerGrpc.GridManagerBlockingStub managerStub;
 
     private Server resultServer;
     private final int resultPort;
@@ -70,28 +67,27 @@ public class Distributor {
         }, SUBTASK_TIMEOUT_MINUTES, SUBTASK_TIMEOUT_MINUTES, TimeUnit.SECONDS);
     }
 
-    private synchronized void openManagerChannel() {
-        if (managerChannel == null || managerChannel.isShutdown()) {
-            managerChannel = ManagedChannelBuilder.forAddress(managerHost, managerPort)
-                    .usePlaintext()
-                    .build();
-            managerStub = GridManagerGrpc.newBlockingStub(managerChannel);
-            logger.info("Opened manager channel to " + managerHost + ":" + managerPort);
-        }
+    private ManagedChannel openManagerChannel() {
+        ManagedChannel channel = ManagedChannelBuilder.forAddress(managerHost, managerPort)
+                .usePlaintext()
+                .build();
+        logger.info("Opened temporary manager channel to " + managerHost + ":" + managerPort);
+        return channel;
     }
 
-    public synchronized void shutdownManagerChannel() {
-        if (managerChannel != null) {
-            managerChannel.shutdown();
+    public void shutdownManagerChannel(ManagedChannel channel) {
+        if (channel != null && !channel.isShutdown()) {
+            logger.info("Shutting down temporary manager channel...");
+            channel.shutdown();
             try {
-                if (!managerChannel.awaitTermination(5, TimeUnit.SECONDS)) {
-                    managerChannel.shutdownNow();
+                if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
+                    channel.shutdownNow();
                 }
+                logger.info("Temporary manager channel shutdown complete.");
             } catch (InterruptedException e) {
-                managerChannel.shutdownNow();
+                channel.shutdownNow();
                 Thread.currentThread().interrupt();
             }
-            logger.info("Manager channel shutdown.");
         }
     }
 
@@ -157,96 +153,155 @@ public class Distributor {
     public void runTask() {
         long taskId = task.getId();
         Iterator<?> subtaskIterator = task.getSubtaskIterator();
-        long subtaskId = 0;
+        long subtaskIdCounter = 0; // Используем счетчик для ID
+
         while (subtaskIterator.hasNext()) {
             Object nextSubtask = subtaskIterator.next();
+            subtaskIdCounter++; // Увеличиваем ID для каждой новой подзадачи
+            final long currentSubtaskId = subtaskIdCounter; // final для использования в лямбдах/потоках
+
             try {
                 ByteString inputDataBytes = serializeToByteString(nextSubtask);
-                subtaskId++;
-                submitSubtask(taskId, subtaskId, inputDataBytes);
-            } catch (Exception e) {
-                logger.log(Level.SEVERE, "Failed to serialize subtask " + subtaskId + ": " + e.getMessage(), e);
-                throw new RuntimeException(e);
-            }
-        }
-    }
+                logger.info("Prepared subtask " + taskId + "/" + currentSubtaskId);
 
-    public void submitSubtask(long taskId, long subtaskId, ByteString byteString) {
-        int attempt = 0;
-        boolean success = false;
-        try {
-            task.addResult(new Subtask(subtaskId, SubtaskStatus.RUNNING, null, System.currentTimeMillis(), byteString));
-        } catch (IOException | ClassNotFoundException e) {
-            throw new RuntimeException(e);
-        }
-        while (attempt < MAX_RETRIES && !success) {
-            logger.info(String.format("Submitting subtask %d/%d, attempt %d", taskId, subtaskId, attempt + 1));
-            success = attemptSubmitSubtask(taskId, subtaskId, byteString);
-            if (!success) {
-                logger.warning(String.format("Attempt %d for subtask %d/%d failed", taskId, subtaskId, attempt + 1));
-                attempt++;
                 try {
-                    Thread.sleep(2000);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+                    task.addResult(new Subtask(currentSubtaskId, SubtaskStatus.PENDING, null, System.currentTimeMillis(), inputDataBytes));
+                } catch (IOException | ClassNotFoundException e) {
+                    logger.log(Level.SEVERE, "Failed to add initial PENDING status for subtask " + taskId + "/" + currentSubtaskId, e);
+                     continue;
+                }
+
+                submitSubtaskWithRetries(taskId, currentSubtaskId, inputDataBytes);
+
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "Failed to serialize subtask " + taskId + "/" + currentSubtaskId + ": " + e.getMessage(), e);
+                try {
+                    Subtask existing = task.getResults().get(currentSubtaskId);
+                    ByteString data = (existing != null) ? existing.getData() : null;
+                    task.addResult(new Subtask(currentSubtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), data));
+                } catch (Exception innerEx) {
+                    logger.log(Level.SEVERE, "Failed to mark subtask " + taskId + "/" + currentSubtaskId + " as FAILED after serialization error", innerEx);
                 }
             }
         }
+
+        logger.info("All subtasks from iterator have been processed for task " + taskId);
+    }
+
+    public void submitSubtaskWithRetries(long taskId, long subtaskId, ByteString byteString) {
+        int attempt = 0;
+        boolean success = false;
+
+        while (attempt < MAX_RETRIES && !success) {
+            logger.info(String.format("Attempting to dispatch subtask %d/%d (Attempt %d/%d)", taskId, subtaskId, attempt + 1, MAX_RETRIES));
+            success = attemptDispatchSubtask(taskId, subtaskId, byteString);
+
+            if (!success) {
+                logger.warning(String.format("Dispatch attempt %d for subtask %d/%d failed.", attempt + 1, taskId, subtaskId));
+                attempt++;
+                if (attempt < MAX_RETRIES) {
+                    try {
+                        Thread.sleep(2000L * (attempt));
+                    } catch (InterruptedException e) {
+                        logger.warning("Retry delay interrupted for subtask " + taskId + "/" + subtaskId);
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+
         if (!success) {
-            logger.severe(String.format("Subtask %d/%d failed after %d attempts. Marking as FAILED.", taskId, subtaskId, MAX_RETRIES));
+            logger.severe(String.format("Subtask %d/%d failed to dispatch after %d attempts. Marking as FAILED.", taskId, subtaskId, MAX_RETRIES));
             try {
                 task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), byteString));
             } catch (IOException | ClassNotFoundException e) {
-                throw new RuntimeException(e);
+                logger.log(Level.SEVERE, "Failed to mark subtask " + taskId + "/" + subtaskId + " as FAILED locally after dispatch failures", e);
             }
+        } else {
+            logger.info(String.format("Subtask %d/%d dispatched successfully.", taskId, subtaskId));
         }
     }
 
-    private boolean attemptSubmitSubtask(long taskId, long subtaskId, ByteString byteString) {
-        String[] files = task.getFileNames();
-        logger.info(String.format("Trying to submit subtask %d/%d with files: %s", taskId, subtaskId, Arrays.toString(files)));
+    private boolean attemptDispatchSubtask(long taskId, long subtaskId, ByteString byteString) {
+        logger.info(String.format("Attempting dispatch for subtask %d/%d: Requesting worker...", taskId, subtaskId));
 
         GridComms.WorkerAssignment workerAssignment = requestWorkerFromManager(taskId, subtaskId);
+
         if (!workerAssignment.getWorkerAvailable()) {
-            logger.info(String.format("No available worker for task %d/%d: %s", taskId, subtaskId, workerAssignment.getMessage()));
+            logger.warning(String.format("No available worker from manager for task %d/%d: %s", taskId, subtaskId, workerAssignment.getMessage()));
             return false;
         }
 
-        ManagedChannel channel = null;
+        logger.info(String.format("Worker %s assigned for subtask %d/%d. Proceeding to send data.",
+                workerAssignment.getAssignedWorker().getWorkerId(), taskId, subtaskId));
+
         try {
-            channel = ManagedChannelBuilder
-                    .forAddress(workerAssignment.getAssignedWorker().getHost(), workerAssignment.getAssignedWorker().getPort())
+            task.addResult(new Subtask(subtaskId, SubtaskStatus.RUNNING, null, System.currentTimeMillis(), byteString));
+            logger.info("Marked subtask " + taskId + "/" + subtaskId + " as RUNNING locally.");
+        } catch (IOException | ClassNotFoundException e) {
+            logger.log(Level.SEVERE, "Failed to mark subtask " + taskId + "/" + subtaskId + " as RUNNING before sending data", e);
+            return false;
+        }
+
+        return sendDataToWorker(workerAssignment, taskId, subtaskId, byteString);
+    }
+
+    private boolean sendDataToWorker(GridComms.WorkerAssignment workerAssignment, long taskId, long subtaskId, ByteString byteString) {
+        String workerHost = workerAssignment.getAssignedWorker().getHost();
+        int workerPort = workerAssignment.getAssignedWorker().getPort();
+        String workerId = workerAssignment.getAssignedWorker().getWorkerId();
+
+        logger.info(String.format("Starting data transmission for subtask %d/%d to worker %s at %s:%d",
+                taskId, subtaskId, workerId, workerHost, workerPort));
+
+        String[] files = task.getFileNames();
+        ManagedChannel workerChannel = null;
+        final boolean[] overallSuccess = {true};
+
+        try {
+            workerChannel = ManagedChannelBuilder
+                    .forAddress(workerHost, workerPort)
                     .usePlaintext()
                     .build();
 
-            SubtaskExchangeGrpc.SubtaskExchangeStub stub = SubtaskExchangeGrpc.newStub(channel);
+            SubtaskExchangeGrpc.SubtaskExchangeStub stub = SubtaskExchangeGrpc.newStub(workerChannel);
             CountDownLatch latch = new CountDownLatch(1);
-            final boolean[] overallSuccess = {true};
 
             StreamObserver<GridComms.SubtaskUploadResponse> responseObserver = new StreamObserver<GridComms.SubtaskUploadResponse>() {
                 @Override
                 public void onNext(GridComms.SubtaskUploadResponse response) {
                     if (response.hasAck()) {
-                        logger.info(String.format("Ack received for subtask %d/%d: %s", taskId, subtaskId, response.getAck().getMessage()));
+                        logger.info(String.format("Ack received for subtask %d/%d from worker %s: %s", taskId, subtaskId, workerId, response.getAck().getMessage()));
                     } else if (response.hasFileStatus()) {
                         GridComms.FileStatus status = response.getFileStatus();
-                        logger.info(String.format("File status for subtask %d/%d: file=%s, success=%s, detail=%s, bytes received=%d",
-                                taskId, subtaskId, status.getFileName(), status.getSuccess(), status.getDetail(), status.getBytesReceived()));
+                        logger.info(String.format("File status for subtask %d/%d from worker %s: file=%s, success=%s, detail=%s, bytes received=%d",
+                                taskId, subtaskId, workerId, status.getFileName(), status.getSuccess(), status.getDetail(), status.getBytesReceived()));
                         skipCurrentFileUpload = false;
                         if (currentlySendingFile != null &&
-                                currentlySendingFile.equals(status.getFileName()) &&
-                                String.format("File %s already exists%n", currentlySendingFile).equals(status.getDetail())) {
-                            logger.info(String.format("Worker indicates file %s already exists, aborting upload for this file", status.getFileName()));
-                            skipCurrentFileUpload = true;
+                                currentlySendingFile.equals(status.getFileName())) {
+                            status.getDetail();
+                            if (status.getDetail().contains("already exists")) {
+                                logger.info(String.format("Worker %s indicates file %s already exists, skipping upload for this file.", workerId, status.getFileName()));
+                                skipCurrentFileUpload = true;
+                            }
+                        }
+                        if (!status.getSuccess()) {
+                            logger.warning("File upload failed according to worker status: " + status.getFileName());
+                             overallSuccess[0] = false;
                         }
                     } else if (response.hasFinalResult()) {
                         GridComms.OverallResult result = response.getFinalResult();
-                        logger.info(String.format("Final result for subtask %d/%d: Success=%s, Processed=%d, Message=%s",
-                                taskId, subtaskId, result.getOverallSuccess(), result.getFilesProcessedCount(), result.getFinalMessage()));
+                        logger.info(String.format("Final result for subtask %d/%d from worker %s: Success=%s, Processed=%d, Message=%s",
+                                taskId, subtaskId, workerId, result.getOverallSuccess(), result.getFilesProcessedCount(), result.getFinalMessage()));
+                        if (!result.getOverallSuccess()) {
+                            logger.warning("Worker reported overall failure in final result.");
+                            overallSuccess[0] = false;
+                        }
                     } else if (response.hasError()) {
                         GridComms.ErrorDetails errorDetails = response.getError();
-                        logger.severe(String.format("Error for subtask %d/%d: %s, related file: %s",
-                                taskId, subtaskId, errorDetails.getErrorMessage(), errorDetails.getFailedFileName()));
+                        logger.severe(String.format("Error reported by worker %s for subtask %d/%d: %s, related file: %s, fatal: %s",
+                                workerId, taskId, subtaskId, errorDetails.getErrorMessage(), errorDetails.getFailedFileName(), errorDetails.getFatal()));
                         if (errorDetails.getFatal()) {
                             overallSuccess[0] = false;
                         }
@@ -255,20 +310,21 @@ public class Distributor {
 
                 @Override
                 public void onError(Throwable t) {
-                    logger.log(Level.SEVERE, String.format("Error uploading subtask %d/%d: %s", taskId, subtaskId, Status.fromThrowable(t)), t);
+                    logger.log(Level.SEVERE, String.format("Error during gRPC stream with worker %s for subtask %d/%d: %s", workerId, taskId, subtaskId, Status.fromThrowable(t)), t);
                     overallSuccess[0] = false;
-                    latch.countDown();
+                    if (latch.getCount() > 0) latch.countDown();
                 }
 
                 @Override
                 public void onCompleted() {
-                    logger.info(String.format("Subtask %d/%d upload completed", taskId, subtaskId));
-                    latch.countDown();
+                    logger.info(String.format("Worker %s completed response stream for subtask %d/%d.", workerId, taskId, subtaskId));
+                    if (latch.getCount() > 0) latch.countDown();
                 }
             };
 
             StreamObserver<GridComms.SubtaskUploadMessage> uploadObserver = stub.sendSubtask(responseObserver);
-            logger.info(String.format("Sending metadata for subtask %d/%d", taskId, subtaskId));
+
+            logger.info(String.format("Sending metadata for subtask %d/%d to worker %s", taskId, subtaskId, workerId));
             GridComms.SubtaskMetadata metadata = GridComms.SubtaskMetadata.newBuilder()
                     .setTaskId(taskId)
                     .setSubtaskId(subtaskId)
@@ -278,15 +334,23 @@ public class Distributor {
                     .build();
             uploadObserver.onNext(GridComms.SubtaskUploadMessage.newBuilder().setSubtaskMetadata(metadata).build());
 
-            A:
             for (String fileName : files) {
+                if (!overallSuccess[0]) {
+                    logger.warning("Skipping remaining file uploads for subtask " + taskId + "/" + subtaskId + " due to previous fatal error.");
+                    break;
+                }
+
                 Path path = Paths.get(taskDirectory, fileName);
                 if (!Files.exists(path) || !Files.isReadable(path)) {
-                    throw new RuntimeException("Cannot read file: " + path);
+                    logger.severe("Cannot read file: " + path + ". Failing subtask.");
+                    uploadObserver.onError(Status.FAILED_PRECONDITION.withDescription("Distributor cannot read file: " + path.getFileName()).asRuntimeException());
+                    overallSuccess[0] = false;
+                    return false;
                 }
                 currentlySendingFile = fileName;
                 skipCurrentFileUpload = false;
-                logger.info(String.format("Sending header for file %s", path.getFileName()));
+
+                logger.info(String.format("Sending header for file %s to worker %s", path.getFileName(), workerId));
                 GridComms.FileHeader header = GridComms.FileHeader.newBuilder()
                         .setFileName(path.getFileName().toString())
                         .build();
@@ -298,61 +362,105 @@ public class Distributor {
                     int read;
                     while ((read = in.read(buffer)) != -1) {
                         if (skipCurrentFileUpload) {
-                            logger.info("Upload skipped for file " + fileName);
-                            break A;
+                            logger.info("Upload skipped for file " + fileName + " based on worker response.");
+                            break;
                         }
+                        if (!overallSuccess[0]) {
+                            logger.warning("Aborting file " + fileName + " upload due to fatal error during transmission.");
+                            break;
+                        }
+
                         GridComms.FileChunk chunk = GridComms.FileChunk.newBuilder().setData(ByteString.copyFrom(buffer, 0, read)).build();
                         uploadObserver.onNext(GridComms.SubtaskUploadMessage.newBuilder().setFileChunk(chunk).build());
                         bytesSent += read;
                     }
-                    logger.info(String.format("Sent %d bytes for file %s", bytesSent, path.getFileName()));
-                } catch (IOException e) {
-                    uploadObserver.onError(Status.INTERNAL.withDescription("Failed to read file: " + path.getFileName())
-                            .withCause(e).asRuntimeException());
+                    if (!skipCurrentFileUpload && overallSuccess[0]) {
+                        logger.info(String.format("Sent %d bytes for file %s to worker %s", bytesSent, path.getFileName(), workerId));
+                    }
+                } catch (Exception e) {
+                    logger.log(Level.SEVERE, "Error sending chunk for file " + path.getFileName() + " to worker " + workerId, e);
+                    overallSuccess[0] = false;
+                    try {
+                        uploadObserver.onError(Status.INTERNAL.withDescription("Distributor failed during file read/send: " + path.getFileName())
+                                .withCause(e).asRuntimeException());
+                    } catch (Exception observerException) {
+                        logger.log(Level.SEVERE, "Failed to notify worker of send error.", observerException);
+                    }
                     return false;
                 } finally {
                     currentlySendingFile = null;
                 }
             }
+            if (overallSuccess[0]) {
+                logger.info(String.format("All data sent for subtask %d/%d to worker %s. Completing upload stream.", taskId, subtaskId, workerId));
+                uploadObserver.onCompleted();
+            } else {
+                logger.warning("Upload stream for subtask " + taskId + "/" + subtaskId + " to worker " + workerId + " not completed due to errors.");
+            }
 
-            logger.info(String.format("All data for subtask %d/%d sent", taskId, subtaskId));
-            uploadObserver.onCompleted();
             try {
+                logger.fine("Waiting for worker " + workerId + " response completion (latch)...");
                 if (!latch.await(SUBTASK_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
-                    logger.severe(String.format("Worker did not respond in time for subtask %d/%d", taskId, subtaskId));
+                    logger.severe(String.format("Worker %s did not respond completely in time for subtask %d/%d. Cancelling.", workerId, taskId, subtaskId));
                     overallSuccess[0] = false;
-                    responseObserver.onError(Status.CANCELLED.withDescription("Timeout waiting for worker reply").asRuntimeException());
                 }
             } catch (InterruptedException e) {
+                logger.warning("Interrupted while waiting for worker response for subtask " + taskId + "/" + subtaskId);
                 overallSuccess[0] = false;
                 Thread.currentThread().interrupt();
             }
-            logger.info(String.format("Submission ended for subtask %d/%d, success=%s", taskId, subtaskId, overallSuccess[0]));
+
+            logger.info(String.format("Data transmission ended for subtask %d/%d to worker %s, final success status: %s", taskId, subtaskId, workerId, overallSuccess[0]));
             return overallSuccess[0];
+
         } catch (Exception e) {
-            logger.log(Level.SEVERE, String.format("Exception in submission for subtask %d/%d: %s", taskId, subtaskId, e.getMessage()), e);
+            logger.log(Level.SEVERE, String.format("Unexpected exception during data transmission for subtask %d/%d to worker %s: %s", taskId, subtaskId, workerId, e.getMessage()), e);
             return false;
         } finally {
-            if (channel != null) {
-                channel.shutdownNow();
+            if (workerChannel != null) {
+                logger.fine("Shutting down channel to worker " + workerId);
+                workerChannel.shutdown();
+                try {
+                    if (!workerChannel.awaitTermination(5, TimeUnit.SECONDS)) {
+                        workerChannel.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    workerChannel.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+                logger.fine("Channel to worker " + workerId + " shut down.");
             }
         }
     }
 
     private GridComms.WorkerAssignment requestWorkerFromManager(long taskId, long subtaskId) {
+        ManagedChannel tempManagerChannel = null;
         try {
+            tempManagerChannel = openManagerChannel();
+            GridManagerGrpc.GridManagerBlockingStub tempManagerStub = GridManagerGrpc.newBlockingStub(tempManagerChannel); // Создаем заглушку
+
             GridComms.SubtaskRequest request = GridComms.SubtaskRequest.newBuilder()
                     .setTaskId(taskId)
                     .setSubtaskId(subtaskId)
                     .build();
             logger.info(String.format("Requesting worker for task %d/%d", taskId, subtaskId));
-            return managerStub.withDeadlineAfter(15, TimeUnit.SECONDS).requestWorker(request);
+            return tempManagerStub.withDeadlineAfter(15, TimeUnit.SECONDS).requestWorker(request);
         } catch (StatusRuntimeException e) {
             logger.log(Level.SEVERE, "Error requesting worker: " + e.getStatus(), e);
             return GridComms.WorkerAssignment.newBuilder()
                     .setWorkerAvailable(false)
                     .setMessage("Error contacting manager: " + e.getStatus())
                     .build();
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Failed to request worker due to unexpected error: " + e.getMessage(), e);
+            return GridComms.WorkerAssignment.newBuilder()
+                    .setWorkerAvailable(false)
+                    .setMessage("Failed to request worker: " + e.getMessage())
+                    .build();
+        } finally {
+            if (tempManagerChannel != null) {
+                shutdownManagerChannel(tempManagerChannel);
+            }
         }
     }
 
@@ -361,25 +469,71 @@ public class Distributor {
         var runningTasks = task.getResults().entrySet().stream()
                 .filter(entry -> entry.getValue().getStatus().equals(SubtaskStatus.RUNNING))
                 .toList();
-        for (Map.Entry<Long, Subtask> entry : runningTasks) {
-            long subtaskId = entry.getValue().getId();
-            GridComms.WorkerStatusRequest request = GridComms.WorkerStatusRequest.newBuilder()
-                    .setTaskId(task.getId())
-                    .setSubtaskId(subtaskId)
-                    .build();
-            try {
-                GridComms.WorkerStatusResponse response = managerStub.withDeadlineAfter(5, TimeUnit.SECONDS)
-                        .getWorkerStatus(request);
-                if (response.getWorkerStatus().equals(GridComms.WorkerStatus.DEAD)) {
-                    Subtask failedTask = task.getResults().get(subtaskId);
-                    task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), failedTask.getData()));
+
+        ManagedChannel tempManagerChannel = null;
+        GridManagerGrpc.GridManagerBlockingStub tempManagerStub = null;
+        boolean channelOpened = false;
+
+        try {
+            if (!runningTasks.isEmpty()) {
+                tempManagerChannel = openManagerChannel();
+                tempManagerStub = GridManagerGrpc.newBlockingStub(tempManagerChannel);
+                channelOpened = true;
+            } else {
+                logger.info("No running tasks to check status for.");
+                reassignFailedSubtasks();
+                return;
+            }
+
+            for (Map.Entry<Long, Subtask> entry : runningTasks) {
+                long subtaskId = entry.getValue().getId();
+                if (!task.getResults().get(subtaskId).getStatus().equals(SubtaskStatus.RUNNING)) {
+                    continue;
                 }
-            } catch (StatusRuntimeException e) {
-                logger.log(Level.SEVERE, String.format("Error checking status for subtask %d: %s", subtaskId, e.getStatus()), e);
-            } catch (IOException | ClassNotFoundException e) {
-                throw new RuntimeException(e);
+
+                GridComms.WorkerStatusRequest request = GridComms.WorkerStatusRequest.newBuilder()
+                        .setTaskId(task.getId())
+                        .setSubtaskId(subtaskId)
+                        .build();
+                try {
+                    logger.fine("Checking status for subtask " + task.getId() + "/" + subtaskId);
+                    GridComms.WorkerStatusResponse response = tempManagerStub
+                            .withDeadlineAfter(5, TimeUnit.SECONDS)
+                            .getWorkerStatus(request);
+
+                    GridComms.WorkerStatus currentWorkerStatus = response.getWorkerStatus();
+                    logger.info("Manager reports status " + currentWorkerStatus + " for worker on subtask " + task.getId() + "/" + subtaskId);
+
+                    if (currentWorkerStatus == GridComms.WorkerStatus.DEAD || currentWorkerStatus == GridComms.WorkerStatus.IDLE) {
+                        logger.warning("Worker for subtask " + task.getId() + "/" + subtaskId + " reported as " + currentWorkerStatus + " by manager. Marking subtask as FAILED.");
+                        Subtask failedTask = task.getResults().get(subtaskId);
+                        ByteString data = (failedTask != null) ? failedTask.getData() : null;
+                        if (failedTask != null && failedTask.getStatus() == SubtaskStatus.RUNNING) {
+                            task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), data));
+                        }
+                    }
+                } catch (StatusRuntimeException e) {
+                    if (e.getStatus().getCode() == Status.Code.NOT_FOUND) {
+                        logger.warning(String.format("Manager reported NOT_FOUND for worker on subtask %d/%d. Assuming task failed or completed elsewhere.", task.getId(), subtaskId));
+                        Subtask failedTask = task.getResults().get(subtaskId);
+                        if (failedTask != null && failedTask.getStatus() == SubtaskStatus.RUNNING) {
+                            task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), failedTask.getData()));
+                        }
+                    } else {
+                        logger.log(Level.SEVERE, String.format("Error checking status via manager for subtask %d/%d: %s", task.getId(), subtaskId, e.getStatus()), e);
+                    }
+                } catch (IOException | ClassNotFoundException e) {
+                    logger.log(Level.SEVERE, String.format("Error updating subtask %d/%d status locally after check: %s", task.getId(), subtaskId, e.getMessage()), e);
+                }
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Unexpected error during checkRunningTasks setup or loop: " + e.getMessage(), e);
+        } finally {
+            if (channelOpened && tempManagerChannel != null) {
+                shutdownManagerChannel(tempManagerChannel);
             }
         }
+
         logger.info("Finished checking running tasks");
         reassignFailedSubtasks();
     }
@@ -391,10 +545,11 @@ public class Distributor {
                 long subtaskId = entry.getKey();
                 ByteString inputData = entry.getValue().getData();
                 if (inputData == null) {
-                    throw new RuntimeException("Cannot reassign subtask " + entry.getValue().getId());
+                    logger.severe("Cannot reassign subtask " + entry.getValue().getId());
+                    return;
                 }
                 logger.info(String.format("Reassigning failed subtask %d", subtaskId));
-                submitSubtask(task.getId(), subtaskId, inputData);
+                submitSubtaskWithRetries(task.getId(), subtaskId, inputData);
             }
         }
     }

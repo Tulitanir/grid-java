@@ -32,7 +32,6 @@ public class Main {
         }
 
         distributor.shutdownScheduler();
-        distributor.shutdownManagerChannel();
         distributor.stopResultServer();
 
         resultServerThread.join();
