@@ -7,6 +7,7 @@ public class Subtask {
     private SubtaskStatus status;
     private ByteString result;
     private long startTime;
+    private long completionTime;
     private ByteString data;
 
     public Subtask(long id, SubtaskStatus status, ByteString result, long startTime) {
@@ -26,6 +27,7 @@ public class Subtask {
         this.result = result;
         this.startTime = startTime;
         this.data = data;
+        this.completionTime = 0;
     }
 
     public long getId() {
@@ -38,5 +40,13 @@ public class Subtask {
 
     public ByteString getResult() {
         return result;
+    }
+
+    public long getCompletionTime() {
+        return completionTime;
+    }
+
+    public void setCompletionTime(long completionTime) {
+        this.completionTime = completionTime;
     }
 }

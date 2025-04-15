@@ -27,8 +27,6 @@ public class Distributor {
 
     private static final int CHUNK_SIZE = 8 * 1024;
     private static final int SUBTASK_TIMEOUT_MINUTES = 20;
-    private static final int RESULT_SERVER_PORT = 10000;
-    private static final String DISTRIBUTOR_HOST = "localhost";
     private static final int MAX_RETRIES = 3;
 
     private final String managerHost;
@@ -46,25 +44,64 @@ public class Distributor {
 
     private final ScheduledExecutorService subtaskMonitoringScheduler = Executors.newSingleThreadScheduledExecutor();
 
-    public Distributor(String managerHost, int managerPort, String taskDirectory, long taskId) throws InterruptedException {
-        this(managerHost, managerPort, taskDirectory, DISTRIBUTOR_HOST, RESULT_SERVER_PORT, taskId);
-    }
+    public Distributor(String managerHost, int managerPort, String taskDirectory, String distributorHost, int resultPort, long taskId) throws IOException {
+        logger.info("Initializing Distributor...");
+        logger.info("  Manager Host: " + managerHost);
+        logger.info("  Manager Port: " + managerPort);
+        logger.info("  Task Directory: " + taskDirectory);
+        logger.info("  Distributor Host (for results): " + distributorHost);
+        logger.info("  Distributor Port (for results): " + resultPort);
+        logger.info("  Task ID: " + taskId);
 
-    public Distributor(String managerHost, int managerPort, String taskDirectory, String distributorHost, int resultPort, long taskId) throws InterruptedException {
+        if (managerHost == null || managerHost.trim().isEmpty()) {
+            throw new IllegalArgumentException("Manager host cannot be null or empty.");
+        }
+        if (taskDirectory == null || taskDirectory.trim().isEmpty()) {
+            throw new IllegalArgumentException("Task directory cannot be null or empty.");
+        }
+        if (distributorHost == null || distributorHost.trim().isEmpty()) {
+            throw new IllegalArgumentException("Distributor host cannot be null or empty.");
+        }
+        if (managerPort <= 0 || managerPort > 65535) {
+            throw new IllegalArgumentException("Invalid manager port: " + managerPort + ". Must be between 1 and 65535.");
+        }
+        if (resultPort <= 0 || resultPort > 65535) {
+            throw new IllegalArgumentException("Invalid result listener port: " + resultPort + ". Must be between 1 and 65535.");
+        }
+        Path taskPath = Paths.get(taskDirectory);
+        if (!Files.isDirectory(taskPath) || !Files.isReadable(taskPath)) {
+            logger.warning("Task directory does not exist or is not readable: " + taskDirectory);
+        }
+
+
         this.managerHost = managerHost;
         this.managerPort = managerPort;
         this.taskDirectory = taskDirectory;
         this.distributorHost = distributorHost;
         this.resultPort = resultPort;
-        this.task = new Task(taskId, taskDirectory);
-        openManagerChannel();
+
+        try {
+            this.task = new Task(taskId, this.taskDirectory);
+            logger.info("Task object initialized for Task ID: " + taskId + " with directory: " + this.taskDirectory);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Failed to initialize Task object for ID " + taskId + " and directory '" + this.taskDirectory + "'", e);
+            throw new IOException("Failed to initialize Task: " + e.getMessage(), e);
+        }
+
+        logger.info("Scheduling periodic check for running subtasks every " + SUBTASK_TIMEOUT_MINUTES + " seconds.");
         subtaskMonitoringScheduler.scheduleWithFixedDelay(() -> {
-            try {
-                checkRunningTasks();
-            } catch (Exception e) {
-                logger.log(Level.SEVERE, "Ошибка при выполнении проверки задач: " + e.getMessage(), e);
-            }
-        }, SUBTASK_TIMEOUT_MINUTES, SUBTASK_TIMEOUT_MINUTES, TimeUnit.SECONDS);
+                    try {
+                        logger.fine("Executing periodic task check...");
+                        checkRunningTasks();
+                    } catch (Exception e) {
+                        logger.log(Level.SEVERE, "Error during scheduled task check execution: " + e.getMessage(), e);
+                    }
+                },
+                SUBTASK_TIMEOUT_MINUTES,
+                SUBTASK_TIMEOUT_MINUTES,
+                TimeUnit.SECONDS);
+
+        logger.info("Distributor initialized successfully.");
     }
 
     private ManagedChannel openManagerChannel() {
@@ -153,12 +190,12 @@ public class Distributor {
     public void runTask() {
         long taskId = task.getId();
         Iterator<?> subtaskIterator = task.getSubtaskIterator();
-        long subtaskIdCounter = 0; // Используем счетчик для ID
+        long subtaskIdCounter = 0;
 
         while (subtaskIterator.hasNext()) {
             Object nextSubtask = subtaskIterator.next();
-            subtaskIdCounter++; // Увеличиваем ID для каждой новой подзадачи
-            final long currentSubtaskId = subtaskIdCounter; // final для использования в лямбдах/потоках
+            subtaskIdCounter++;
+            long currentSubtaskId = subtaskIdCounter;
 
             try {
                 ByteString inputDataBytes = serializeToByteString(nextSubtask);
@@ -521,6 +558,10 @@ public class Distributor {
                         }
                     } else {
                         logger.log(Level.SEVERE, String.format("Error checking status via manager for subtask %d/%d: %s", task.getId(), subtaskId, e.getStatus()), e);
+                        Subtask failedTask = task.getResults().get(subtaskId);
+                        if (failedTask != null && failedTask.getStatus() == SubtaskStatus.RUNNING) {
+                            task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, null, System.currentTimeMillis(), failedTask.getData()));
+                        }
                     }
                 } catch (IOException | ClassNotFoundException e) {
                     logger.log(Level.SEVERE, String.format("Error updating subtask %d/%d status locally after check: %s", task.getId(), subtaskId, e.getMessage()), e);
