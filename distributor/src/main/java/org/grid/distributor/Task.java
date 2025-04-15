@@ -320,5 +320,14 @@ public class Task {
             return ois.readObject();
         }
     }
+
+    public long getAverageSubtaskExecutionTime() {
+        long totalTime = 0;
+        int count = results.size();
+        for (Subtask st : results.values()) {
+            totalTime += st.getExecutionTime();
+        }
+        return count > 0 ? totalTime / count : 0;
+    }
 }
 

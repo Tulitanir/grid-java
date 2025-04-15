@@ -630,9 +630,11 @@ public class Distributor {
                 try {
                     if (!request.getSuccess()) {
                         logger.warning(String.format("Result for subtask %d/%d indicates failure. Scheduling reassignment.", taskId, subtaskId));
-                        task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, resultBytes, System.currentTimeMillis()));
+                        task.addResult(new Subtask(subtaskId, SubtaskStatus.FAILED, resultBytes));
                     } else {
-                        task.addResult(new Subtask(subtaskId, SubtaskStatus.DONE, resultBytes, System.currentTimeMillis()));
+                        var subtaskRes = new Subtask(subtaskId, SubtaskStatus.DONE, resultBytes);
+                        subtaskRes.setExecutionTime(request.getExecutionTime());
+                        task.addResult(subtaskRes);
                     }
                 } catch (ClassNotFoundException | IOException e) {
                     throw new RuntimeException(e);

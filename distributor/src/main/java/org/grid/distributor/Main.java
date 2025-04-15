@@ -87,6 +87,10 @@ public class Main {
         long seconds = duration.minusMinutes(minutes).getSeconds();
 
         System.out.println("Task completion time: " + minutes + " mins. " + seconds + " sec.");
+
+        long avgTimeMillis = distributor.getTask().getAverageSubtaskExecutionTime();
+        System.out.println("Average subtask execution time: " + avgTimeMillis + " ms");
+        System.out.println("Average subtask execution time: " + (avgTimeMillis / 1000.0) + " sec");
     }
 
     private static void printUsage() {

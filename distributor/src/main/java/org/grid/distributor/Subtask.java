@@ -6,28 +6,34 @@ public class Subtask {
     private long id;
     private SubtaskStatus status;
     private ByteString result;
-    private long startTime;
-    private long completionTime;
+    private long executionTime;
     private ByteString data;
 
-    public Subtask(long id, SubtaskStatus status, ByteString result, long startTime) {
+    public Subtask(long id, SubtaskStatus status, ByteString result) {
         this.id = id;
         this.status = status;
         this.result = result;
-        this.startTime = startTime;
+        this.executionTime = 0;
     }
 
     public ByteString getData() {
         return data;
     }
 
+    public long getExecutionTime() {
+        return executionTime;
+    }
+
+    public void setExecutionTime(long executionTime) {
+        this.executionTime = executionTime;
+    }
+
     public Subtask(long id, SubtaskStatus status, ByteString result, long startTime, ByteString data) {
         this.id = id;
         this.status = status;
         this.result = result;
-        this.startTime = startTime;
         this.data = data;
-        this.completionTime = 0;
+        this.executionTime = 0;
     }
 
     public long getId() {
@@ -42,11 +48,12 @@ public class Subtask {
         return result;
     }
 
-    public long getCompletionTime() {
-        return completionTime;
+
+    public void setResult(ByteString result) {
+        this.result = result;
     }
 
-    public void setCompletionTime(long completionTime) {
-        this.completionTime = completionTime;
+    public void setStatus(SubtaskStatus status) {
+        this.status = status;
     }
 }
